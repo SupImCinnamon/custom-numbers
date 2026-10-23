@@ -1,0 +1,6 @@
+[mod]
+id = "custom-numbers"
+name = "Custom Numbers"
+version = "1.0.0"
+readme = "README.md"
+authors = ["Cinnamon", "Shiro"] 

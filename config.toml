@@ -1,0 +1,9 @@
+damage_color = ""
+enabled = true
+headshot_color = ""
+healing_color = ""
+menu_key = "F7"
+stack = true
+stack_headshots = true
+stack_style = "last"
+stack_window = 2
