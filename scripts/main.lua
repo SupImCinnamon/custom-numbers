@@ -14,9 +14,9 @@
 
 local cfg = tempest.config({
 	enabled = true,
-	stack = true,
-	stack_headshots = false,
-	stack_style = "last", -- look of a merged stack: "first", "last" or "body"
+	stack = true, -- body shots add up
+	stack_headshots = "add", -- "each", "add" (a number of their own) or "body" (into the body shots' number)
+	stack_style = "last", -- look of a number headshots joined: "first", "last" or "body"
 	stack_window = 0.4,
 	damage_color = "",
 	headshot_color = "",
@@ -24,8 +24,14 @@ local cfg = tempest.config({
 	menu_key = "F7",
 })
 local active = cfg.enabled ~= false
-local stacking = cfg.stack ~= false
-local merge_heads = cfg.stack_headshots == true -- headshots join the body shot stack
+local stack_body = cfg.stack ~= false
+local stack_heads = cfg.stack_headshots
+-- Older configs stored a boolean: whether headshots joined the body shot stack.
+if type(stack_heads) == "boolean" then
+	stack_heads = not stack_body and "each" or stack_heads and "body" or "add"
+elseif stack_heads ~= "each" and (stack_heads ~= "body" or not stack_body) then
+	stack_heads = "add"
+end
 local STACK_STYLES = { "first", "last", "body" }
 local stack_style = cfg.stack_style
 if stack_style ~= "first" and stack_style ~= "body" then
@@ -50,13 +56,12 @@ local function hex(color)
 	return color and string.format("#%06X", color) or ""
 end
 
--- headshot_color can also be "body": headshots then use the body shot colour.
 local colors = {
 	body = parse_color(cfg.damage_color),
-	head = parse_color(cfg.headshot_color),
 	healing = parse_color(cfg.healing_color),
 }
-local head_same = cfg.headshot_color == "body"
+-- Older configs could set headshot_color to "body"; it now copies the body shot colour.
+colors.head = cfg.headshot_color == "body" and colors.body or parse_color(cfg.headshot_color)
 
 local X86 = tempest.status().arch == "x86"
 
@@ -225,7 +230,7 @@ local function find_entry(list, clip)
 end
 
 local function damage_color(headshot)
-	if headshot and not head_same then
+	if headshot then
 		return colors.head
 	end
 	return colors.body
@@ -289,14 +294,19 @@ local stacks, owners, stack_overlay = {}, {}, nil
 shared.damage_column_caps = shared.damage_column_caps or {}
 local game_caps = shared.damage_column_caps
 
+local function stacking()
+	return stack_body or stack_heads ~= "each"
+end
+
 local function set_cap(overlay)
 	local cap = memory.read_i32(overlay + P.m_nMaxDamageTicksPerDevice)
 	if cap ~= NO_CAP then
 		game_caps[overlay] = cap
 	end
-	if stacking and cap ~= NO_CAP then
+	local lift = stacking()
+	if lift and cap ~= NO_CAP then
 		memory.write_i32(overlay + P.m_nMaxDamageTicksPerDevice, NO_CAP)
-	elseif not stacking and cap == NO_CAP and game_caps[overlay] then
+	elseif not lift and cap == NO_CAP and game_caps[overlay] then
 		memory.write_i32(overlay + P.m_nMaxDamageTicksPerDevice, game_caps[overlay])
 	end
 end
@@ -367,8 +377,8 @@ local function add_damage(original, overlay, target, target_type, value, _, even
 	event = event % 0x100
 	local headshot = event == HEADSHOT_EVENT
 	-- value <= 0 is the "immune" label, which never stacks
-	local stackable = stacking and value > 0 and value < 0x80000000
-	local merged = stackable and merge_heads and headshot
+	local stackable = value > 0 and value < 0x80000000 and (headshot and stack_heads ~= "each" or not headshot and stack_body)
+	local merged = stackable and headshot and stack_heads == "body"
 	spawn_damage(original, overlay, (merged and stack_style == "body") and BODY_EVENT or nil)
 	local entry = newest(list, before)
 	if not entry then
@@ -477,16 +487,22 @@ if not ok then
 	return
 end
 
--- Settings menu
+-- Settings menu, in Wolper's look
+
+local W = require("lib.wolper_ui")
 
 local FALLBACK_KEY = "Insert" -- bound instead when the configured menu key cannot be
-local COMBO_WIDTH = 170
+local MENU_WIDTH = 40 -- in font heights
 
 local menu_open = false
 local dirty = false
 local listening = false -- waiting for a new menu key
 
 local function set_menu(open)
+	-- Opening only happens from a key press, outside a frame, where fonts can be added.
+	if open then
+		W.load_fonts()
+	end
 	menu_open = open
 	listening = false
 	ui.capture(open)
@@ -494,10 +510,10 @@ end
 
 local function save()
 	dirty = false
-	cfg.enabled, cfg.stack, cfg.stack_window = active, stacking, stack_window
-	cfg.stack_headshots, cfg.stack_style = merge_heads, stack_style
+	cfg.enabled, cfg.stack, cfg.stack_window = active, stack_body, stack_window
+	cfg.stack_headshots, cfg.stack_style = stack_heads, stack_style
 	cfg.damage_color = hex(colors.body)
-	cfg.headshot_color = head_same and "body" or hex(colors.head)
+	cfg.headshot_color = hex(colors.head)
 	cfg.healing_color = hex(colors.healing)
 	tempest.save_config(cfg)
 end
@@ -590,113 +606,118 @@ local function from_rgb(rgb)
 	return byte(rgb[1]) * 0x10000 + byte(rgb[2]) * 0x100 + byte(rgb[3])
 end
 
--- What each picker shows, kept while its colour is off so switching back restores it.
+-- Where each picker starts; it keeps the last colour after a reset.
 local picked = {}
 for _, kind in ipairs({ "body", "head", "healing" }) do
 	picked[kind] = to_rgb(colors[kind] or 0xFFFFFF)
 end
 
-local function combo(label, index, items)
-	ui.set_next_item_width(COMBO_WIDTH)
-	return ui.combo(label, index, items)
-end
+local ANIMATIONS = { "Default", "Legacy" }
+local BODY_STACKS = { "Each", "Add up" }
+local BODY_STACK_TIPS = {
+	"Every body shot shows its own number.",
+	"Body shots on a target add up into one number.",
+}
+local HEAD_STACK_MODES = { "each", "add", "body" }
+local HEAD_STACKS = { "Each", "Add up", "With body" }
+local HEAD_STACK_TIPS = {
+	"Every headshot shows its own number.",
+	"Headshots on a target add up into a number of their own.",
+	"Headshots add to the body shots' number.",
+}
+-- While body shots show one by one there is no number to join.
+local HEAD_STACK_TIPS_ALONE = { HEAD_STACK_TIPS[1], HEAD_STACK_TIPS[2], "Needs body shots to add up." }
+local HEAD_STACK_ENABLED_ALONE = { true, true, false }
+-- Short, so the shared control column keeps its width when this row appears.
+local MERGED_STYLES = { "First", "Last", "Body" }
+local MERGED_STYLE_TIPS = {
+	"Styled and colored like its first hit.",
+	"Styled and colored like its latest hit.",
+	"In the body shot style, colored like its latest hit.",
+}
 
-local function swatch(kind)
-	ui.same_line()
-	local rgb, edited = ui.color_edit("##" .. kind, picked[kind], ui.ColorEditFlags.NoInputs)
-	if edited then
+-- Returns true when the row's action button was pressed.
+local function color_row(label, kind, action, action_enabled, action_tip)
+	local rgb, set, changed, acted = W.color_row(label, picked[kind], colors[kind] ~= nil, nil, action, action_enabled, action_tip)
+	if changed then
 		picked[kind] = rgb
-		colors[kind] = from_rgb(rgb)
+		colors[kind] = set and from_rgb(rgb) or nil
 		dirty = true
 	end
+	return acted
 end
 
-local COLOR_MODES = { "Default", "Custom" }
-local HEAD_MODES = { "Default", "Same as body shots", "Custom" }
-
-local function color_row(label, kind)
-	local mode, changed = combo(label, colors[kind] and 2 or 1, COLOR_MODES)
-	if changed then
-		colors[kind] = mode == 2 and from_rgb(picked[kind]) or nil
-		dirty = true
-	end
-	if colors[kind] then
-		swatch(kind)
-	end
-end
-
-local function headshot_row()
-	local mode, changed = combo("Headshots", head_same and 2 or colors.head and 3 or 1, HEAD_MODES)
-	if changed then
-		head_same = mode == 2
-		colors.head = mode == 3 and from_rgb(picked.head) or nil
-		dirty = true
-	end
-	if colors.head then
-		swatch("head")
+local function index_of(list, value)
+	for i, v in ipairs(list) do
+		if v == value then
+			return i
+		end
 	end
 end
 
 local function draw_settings()
-	local choice, changed = combo("Animation", active and 2 or 1, { "Default", "Legacy" })
+	if W.page_header("Custom Numbers") then
+		set_menu(false)
+	end
+
+	W.begin_section()
+	local choice, changed = W.segmented_row("Animation", ANIMATIONS, active and 2 or 1,
+		"Legacy makes damage numbers rise and fade like healing numbers.")
 	if changed then
 		active, dirty = choice == 2, true
 	end
+	W.end_section()
 
-	ui.separator_text("Stacking")
-	local on
-	on, changed = ui.checkbox("Stack hits", stacking)
+	W.begin_section("Stacking")
+	choice, changed = W.segmented_row("Body shots", BODY_STACKS, stack_body and 2 or 1, nil, BODY_STACK_TIPS)
 	if changed then
-		stacking, dirty = on, true
-	end
-	ui.begin_disabled(not stacking)
-	ui.set_next_item_width(COMBO_WIDTH)
-	local window
-	window, changed = ui.slider_float("Max gap between hits", stack_window, 0.05, 2, "%.2f s", ui.SliderFlags.AlwaysClamp)
-	if changed then
-		stack_window, dirty = window, true
-	end
-	on, changed = ui.checkbox("Stack headshots with body shots", merge_heads)
-	if changed then
-		merge_heads, dirty = on, true
-	end
-	ui.begin_disabled(not merge_heads)
-	local style_index = 2
-	for i, name in ipairs(STACK_STYLES) do
-		if name == stack_style then
-			style_index = i
+		stack_body, dirty = choice == 2, true
+		if not stack_body and stack_heads == "body" then
+			stack_heads = "add"
 		end
 	end
-	choice, changed = combo("Merged style", style_index, { "First hit", "Last hit", "Body only" })
+	choice, changed = W.segmented_row("Headshots", HEAD_STACKS, index_of(HEAD_STACK_MODES, stack_heads), nil,
+		stack_body and HEAD_STACK_TIPS or HEAD_STACK_TIPS_ALONE, not stack_body and HEAD_STACK_ENABLED_ALONE or nil)
 	if changed then
-		stack_style, dirty = STACK_STYLES[choice], true
+		stack_heads, dirty = HEAD_STACK_MODES[choice], true
 	end
-	ui.end_disabled()
-	ui.end_disabled()
-	if merge_heads then
-		ui.text_disabled(({
-			first = "One number per target, styled and coloured like its first hit.",
-			last = "One number per target, styled and coloured like its latest hit.",
-			body = "One number per target in the body shot style, coloured like its latest hit.",
-		})[stack_style])
-	else
-		ui.text_disabled("Headshots and body shots stack separately.")
+	if W.begin_reveal("window", stacking()) then
+		local window
+		window, changed = W.slider_row("Combine hits within", stack_window, 0.05, 2, "%.2f s",
+			"A hit that lands later than this after the one before starts a new number.")
+		if changed then
+			stack_window, dirty = window, true
+		end
+		W.end_reveal()
 	end
+	if W.begin_reveal("style", stack_heads == "body") then
+		choice, changed = W.segmented_row("Total looks like", MERGED_STYLES, index_of(STACK_STYLES, stack_style), nil, MERGED_STYLE_TIPS)
+		if changed then
+			stack_style, dirty = STACK_STYLES[choice], true
+		end
+		W.end_reveal()
+	end
+	W.end_section()
 
-	ui.separator_text("Colors")
+	W.begin_section("Colors", "New numbers pick up changes.")
 	color_row("Body shots", "body")
-	headshot_row()
+	local copy_tip = not colors.body and "Pick a body shot color first."
+		or colors.head == colors.body and "Headshots already use the body shot color."
+		or "Headshots take the body shot color."
+	if color_row("Headshots", "head", "Use body color", colors.body ~= nil and colors.body ~= colors.head, copy_tip) then
+		colors.head, picked.head, dirty = colors.body, picked.body, true
+	end
 	color_row("Healing", "healing")
-	ui.text_disabled("New numbers pick up changes.")
+	W.end_section()
 
-	ui.separator_text("Menu")
-	ui.align_text_to_frame_padding()
-	ui.text("Menu key")
-	ui.same_line()
-	if listening then
-		ui.button("Press a key... (Esc cancels)")
-	elseif ui.button(cfg.menu_key .. "##menu_key") then
+	W.begin_section("Menu")
+	if W.keybind_row("Menu key", cfg.menu_key, listening) then
 		listening = true
+	end
+	W.end_section()
+
+	if listening and W.capture_sheet("Menu key", cfg.menu_key, "Ctrl, Shift and Alt combinations work too. Esc cancels.") then
+		listening = false
 	end
 end
 
@@ -719,88 +740,11 @@ local function poll_rebind()
 	end
 end
 
--- Theme: midnight panels, gold trim, parchment text. Pushed around our window
--- only, since every mod draws with the same ImGui style.
-local GOLD, NIGHT, INK = 0xE8B54A, 0x141722, 0x1E2230
-local function rgba(hex, a)
-	return math.floor(hex / 0x10000) % 256 / 255, math.floor(hex / 0x100) % 256 / 255, hex % 256 / 255, a or 1
-end
-local THEME_COLORS = {
-	{ "Text", 0xEDE6D6 },
-	{ "TextDisabled", 0x8C8676 },
-	{ "WindowBg", NIGHT, 0.97 },
-	{ "PopupBg", NIGHT, 0.98 },
-	{ "Border", GOLD, 0.35 },
-	{ "BorderShadow", 0x000000, 0 },
-	{ "TitleBg", 0x191C28 },
-	{ "TitleBgActive", 0x272033 },
-	{ "TitleBgCollapsed", 0x191C28, 0.8 },
-	{ "FrameBg", INK },
-	{ "FrameBgHovered", 0x2A3044 },
-	{ "FrameBgActive", 0x343B54 },
-	{ "CheckMark", GOLD },
-	{ "SliderGrab", GOLD, 0.85 },
-	{ "SliderGrabActive", 0xF6D27A },
-	{ "Button", 0x2A3044 },
-	{ "ButtonHovered", GOLD, 0.40 },
-	{ "ButtonActive", GOLD, 0.65 },
-	{ "Header", GOLD, 0.22 },
-	{ "HeaderHovered", GOLD, 0.38 },
-	{ "HeaderActive", GOLD, 0.55 },
-	{ "Separator", GOLD, 0.30 },
-	{ "ScrollbarBg", NIGHT, 0.6 },
-	{ "ScrollbarGrab", 0x343B54 },
-	{ "ScrollbarGrabHovered", GOLD, 0.45 },
-	{ "ScrollbarGrabActive", GOLD, 0.7 },
-	{ "NavCursor", GOLD },
-}
-local THEME_VARS = {
-	{ "WindowRounding", 10 },
-	{ "WindowBorderSize", 1 },
-	{ "WindowPadding", 16, 14 },
-	{ "WindowTitleAlign", 0.5, 0.5 },
-	{ "PopupRounding", 8 },
-	{ "FrameRounding", 6 },
-	{ "FramePadding", 9, 5 },
-	{ "GrabRounding", 6 },
-	{ "GrabMinSize", 12 },
-	{ "ItemSpacing", 10, 8 },
-	{ "ScrollbarRounding", 6 },
-	{ "SeparatorTextBorderSize", 2 },
-	{ "SeparatorTextPadding", 0, 6 },
-}
-
-local function push_theme()
-	for _, c in ipairs(THEME_COLORS) do
-		ui.push_color(ui.Col[c[1]], rgba(c[2], c[3]))
-	end
-	for _, v in ipairs(THEME_VARS) do
-		ui.push_var(ui.StyleVar[v[1]], v[2], v[3])
-	end
-end
-
-local function pop_theme()
-	ui.pop_var(#THEME_VARS)
-	ui.pop_color(#THEME_COLORS)
-end
-
 ui.on_draw(function()
-	if menu_open then
-		if listening then
-			poll_rebind()
-		end
-		local w, h = ui.screen()
-		ui.set_next_window_pos(w / 2, h / 2, ui.Cond.FirstUseEver, 0.5, 0.5)
-		push_theme()
-		local ok, open = pcall(ui.window, "Custom Numbers", { open = true, flags = ui.WindowFlags.AlwaysAutoResize }, draw_settings)
-		pop_theme()
-		if not ok then
-			error(open, 0)
-		end
-		if open == false then
-			set_menu(false)
-		end
+	if menu_open and listening then
+		poll_rebind()
 	end
+	W.menu("Custom Numbers", menu_open, MENU_WIDTH, draw_settings)
 	-- Sliders and pickers report a change every frame while dragged; write once they let go.
 	if dirty and not ui.is_any_item_active() then
 		save()
@@ -817,7 +761,7 @@ for name, a in pairs(addr) do
 	found[#found + 1] = string.format("%s +0x%x", name, a - base)
 end
 table.sort(found)
-log("hooks live (%s, %s), animation %s, stacking %s, body %s, head %s, healing %s, menu key %s",
+log("hooks live (%s, %s), animation %s, stacking body shots %s and headshots %s within %.2fs, body %s, head %s, healing %s, menu key %s",
 	X86 and "Win32" or "Win64", table.concat(found, ", "), active and "on" or "off",
-	stacking and string.format("%.2fs", stack_window) or "off", show(colors.body),
-	head_same and "body" or show(colors.head), show(colors.healing), bound and cfg.menu_key or "none")
+	stack_body and "add" or "each", stack_heads, stack_window, show(colors.body),
+	show(colors.head), show(colors.healing), bound and cfg.menu_key or "none")
